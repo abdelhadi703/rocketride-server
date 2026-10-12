@@ -165,6 +165,13 @@ container's files are the task's own doing, so a copy is given up past 60
 seconds or 1 GiB, and dumps stop being kept once those under `data/logs`
 reach 4 GiB in all: delete old ones to make room.
 
+A dump is taken whatever the host's `fs.suid_dumpable` is, `2` on Ubuntu
+included: as it starts, before Crashpad registers, the engine sets its own
+dumpable flag to 0 with `prctl(PR_SET_DUMPABLE, 0)`, the one value from which
+Crashpad can take a dump. `RR_ENABLE_DEBUGGER_CONNECTION` keeps a flag of 1 as
+the kernel gave it instead, and a dump is taken from there too (see
+[Security](/operate/security)).
+
 A dump holds part of the task's memory at the moment it crashed, which can
 include the data and the keys it was working with. On Linux and macOS the
 files are readable by the engine's user alone; on Windows they take the

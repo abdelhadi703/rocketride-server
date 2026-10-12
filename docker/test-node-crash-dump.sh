@@ -24,22 +24,26 @@ trap cleanup EXIT
 fail() {
     echo "FATAL: $1"
     [ ! -f "$out/log" ] || tail -n 30 "$out/log" | sed 's/^/  | /'
-    # What decides whether Crashpad may read the crashed process
+    # What decides whether Crashpad may read the crashed process. The image's
+    # engine is execute-only, so the kernel starts it with fs.suid_dumpable as
+    # its dumpable flag, and Crashpad can take a dump from 0 but not from 2:
+    # the engine clears the flag itself as it starts
     docker run --rm --cap-drop ALL --security-opt no-new-privileges "$image" sh -c '
-        echo "  kernel $(uname -r), ptrace_scope $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)"
+        echo "  kernel $(uname -r), ptrace_scope $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a), suid_dumpable $(cat /proc/sys/fs/suid_dumpable 2>/dev/null || echo n/a)"
         grep -E "^(CapEff|Seccomp):" /proc/self/status | sed "s/^/  /"' || true
     exit 1
 }
 
-# crash <what> <python> [docker create options...]
+# crash <what> [docker create options...]
 crash() {
     what=$1
-    code=$2
-    shift 2
+    shift
     echo "Crashing the engine in $image, $what..."
-    # A task's flags, and no --rm: the dump would go with the container
+    # A task's flags, and no --rm: the dump would go with the container.
+    # A C string read at address 0, which no process has mapped: SIGSEGV
     id=$(docker create --cap-drop ALL --security-opt no-new-privileges --memory 2g --cpus 1 \
-        -e ROCKETRIDE_CRASHDB_DIR=/opt/data/crashdb "$@" "$image" ./engine -c "$code" --monitor=app)
+        -e ROCKETRIDE_CRASHDB_DIR=/opt/data/crashdb "$@" "$image" \
+        ./engine -c 'import ctypes; ctypes.string_at(0)' --monitor=app)
     docker start -a "$id" > "$out/log" 2>&1 || true
     rc=$(docker wait "$id")
     # The engine aborts after the fault: 128 + SIGABRT
@@ -55,11 +59,7 @@ crash() {
     id=''
 }
 
-# A C string read at address 0, which no process has mapped: SIGSEGV
-fault='import ctypes; ctypes.string_at(0)'
-crash 'as it starts' "$fault"
-# A task makes itself non-dumpable before it runs pipeline code (ai.proc_privacy)
-crash 'non-dumpable as a task is' "from ai.proc_privacy import make_process_private as p; p(); $fault"
+crash 'as the image user'
 # A task runs as the engine's own uid in the image's group (the launcher's --user and --group-add)
-crash 'as another uid' "$fault" --user 4321:4321 --group-add 1000
+crash 'as another uid' --user 4321:4321 --group-add 1000
 echo "$image: a crash leaves a minidump that can be copied out of the stopped container"
