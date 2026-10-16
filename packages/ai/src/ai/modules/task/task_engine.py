@@ -54,6 +54,7 @@ from ai.constants import (
     CONST_ANALYTICS_SLOWEST_DOCS,
     CONST_TASK_DATA_PATH,
 )
+from ai.account.base import OutOfCreditsError
 from ai import CONST_AI_NODE_SCRIPT
 from ai.common.dap import DAPBase, DAPClient, TransportWebSocket
 from ai.common.rocketride_db import DB_PROVIDERS, db_target, dsn_key, exposes_public_endpoint
@@ -491,6 +492,22 @@ class Task(DAPBase):
             self._parent_task._data_client = None
             # Nothing can answer the requests still waiting on this channel
             await super().on_disconnected(reason or 'Task data connection closed', has_error)
+
+        async def on_receive(self, message):
+            """Answer the task's credit check before it opens a pipe; the rest as usual."""
+            if message.get('type') == 'request' and message.get('command') == 'rrext_check_spend':
+                from ai.account import account
+
+                org_id = self._parent_task.org_id
+                try:
+                    refusal = await account.check_spend(org_id) if org_id else None
+                except Exception as e:
+                    # A failed ledger read refuses the pipe with the ledger's error
+                    await self._send(self.build_exception(message, e))
+                    return
+                await self._send(self.build_response(message, body={'refusal': refusal}))
+                return
+            await super().on_receive(message)
 
     def __init__(
         self,
@@ -1141,36 +1158,7 @@ class Task(DAPBase):
         if self._is_terminating:
             raise RuntimeError('Task is terminating, cannot process data requests')
 
-        # Thread-safe data channel access
-        async with self._data_lock:
-            # Establish the data WebSocket connection on first use.
-            # There is a race condition: the C++ engine emits the ">SVC*1" readiness
-            # signal slightly before the child process's uvicorn server has finished
-            # binding to its port. This means the first connection attempt may hit a
-            # "Connection refused" error. We retry up to 10 times (150ms apart) to
-            # give uvicorn time to start accepting connections.
-            if not self._data_client:
-                uri = f'ws://127.0.0.1:{self._data_port}/task/data'
-
-                @retry(
-                    stop=stop_after_attempt(10),
-                    wait=wait_fixed(0.15),
-                    reraise=True,
-                    before_sleep=lambda retry_state: self.debug_message(
-                        f'Data connection attempt {retry_state.attempt_number} failed, retrying in 0.15s: {retry_state.outcome.exception()}'
-                    ),
-                )
-                async def _connect_data_client():
-                    # Don't retry if subprocess has died
-                    if self._engine_process and self._engine_process.returncode is not None:
-                        raise RuntimeError(f'Subprocess exited with code {self._engine_process.returncode}')
-                    transport = TransportWebSocket(uri)
-                    name = f'DATA-{self.id}'
-                    client = Task.TaskData(parent_task=self, module=name, transport=transport)
-                    await client.connect()
-                    return client
-
-                self._data_client = await _connect_data_client()
+        await self._ensure_data_client()
 
         # Get the arguments
         args = data.get('arguments', {})
@@ -1202,9 +1190,44 @@ class Task(DAPBase):
         # Propagate subprocess failures so callers don't silently
         # receive success for a failed operation.
         if self._data_client.did_fail(response):
+            if response.get('code') == OutOfCreditsError.code:
+                raise OutOfCreditsError(response.get('message'))
             raise RuntimeError(response.get('message', 'Data request failed'))
 
         return response
+
+    async def _ensure_data_client(self) -> None:
+        """Open the data channel to the task process if it is not open yet."""
+        # Thread-safe data channel access
+        async with self._data_lock:
+            # Establish the data WebSocket connection on first use.
+            # There is a race condition: the C++ engine emits the ">SVC*1" readiness
+            # signal slightly before the child process's uvicorn server has finished
+            # binding to its port. This means the first connection attempt may hit a
+            # "Connection refused" error. We retry up to 10 times (150ms apart) to
+            # give uvicorn time to start accepting connections.
+            if not self._data_client:
+                uri = f'ws://127.0.0.1:{self._data_port}/task/data'
+
+                @retry(
+                    stop=stop_after_attempt(10),
+                    wait=wait_fixed(0.15),
+                    reraise=True,
+                    before_sleep=lambda retry_state: self.debug_message(
+                        f'Data connection attempt {retry_state.attempt_number} failed, retrying in 0.15s: {retry_state.outcome.exception()}'
+                    ),
+                )
+                async def _connect_data_client():
+                    # Don't retry if subprocess has died
+                    if self._engine_process and self._engine_process.returncode is not None:
+                        raise RuntimeError(f'Subprocess exited with code {self._engine_process.returncode}')
+                    transport = TransportWebSocket(uri)
+                    name = f'DATA-{self.id}'
+                    client = Task.TaskData(parent_task=self, module=name, transport=transport)
+                    await client.connect()
+                    return client
+
+                self._data_client = await _connect_data_client()
 
     async def _process_exit_code(self) -> Optional[int]:
         """The subprocess exit code, or None if it could not be reaped (see below).
@@ -1894,6 +1917,9 @@ class Task(DAPBase):
             if service_up:
                 self._status.state = TASK_STATE.RUNNING.value
                 self._status.notes = self._service_up_notes
+                # A source inside the task opens pipes with no data from EaaS,
+                # and asks its credit checks over this channel
+                await self._ensure_data_client()
             else:
                 self._status.notes = self._service_down_notes
 

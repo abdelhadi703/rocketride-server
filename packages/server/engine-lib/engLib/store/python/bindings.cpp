@@ -227,6 +227,16 @@ PYBIND11_EMBEDDED_MODULE(engLib, engLib) {
 
     //-------------------------------------------------------------
     /// @details
+    ///		Set the callable that runs before every getPipe() from
+    ///		Python, or None for no gate.
+    ///------------------------------------------------------------
+    engLib.attr("_pipeGate") = py::none();
+    engLib.PYBIND_FUNCTION(setPipeGate, [](py::object gate) {
+        py::module_::import("engLib").attr("_pipeGate") = gate;
+    });
+
+    //-------------------------------------------------------------
+    /// @details
     ///		Return Engine version information.
     ///------------------------------------------------------------
     engLib.PYBIND_FUNCTION(getVersion, []() {
@@ -847,6 +857,11 @@ PYBIND11_EMBEDDED_MODULE(engLib, engLib) {
         .PYBIND_FUNCTION(
             getPipe,
             [](IServiceEndpoint &self) -> IServiceFilterInstance & {
+                // The pipe gate may refuse; its exception reaches the caller
+                py::object gate =
+                    py::module_::import("engLib").attr("_pipeGate");
+                if (!gate.is_none()) gate();
+
                 // Allow others to run while we are doing this
                 engine::python::UnlockPython unlock;
 

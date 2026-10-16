@@ -172,6 +172,9 @@ class DataConn(DAPConn):
         # Key: pipe_id (int), Value: DataConnPipe instance
         self._pipe_map: Dict[int, DataConnPipe] = {}
 
+        # Requests this connection sent to EaaS, by seq, waiting for its response
+        self._asked: Dict[int, asyncio.Future] = {}
+
         # Pipe timeout for zombie detection
         self._pipe_timeout = CONST_DATA_PIPE_TIMEOUT
 
@@ -221,6 +224,29 @@ class DataConn(DAPConn):
     def _target(self) -> Optional['IServiceEndpoint']:
         """Read the source target lazily — never snapshot at connection time."""
         return self._server._target
+
+    async def on_receive(self, message: Optional[Dict[str, Any]] = None) -> None:
+        """Resolve the answer to a request this connection sent; route the rest as usual."""
+        if message and message.get('type') == 'response':
+            future = self._asked.pop(message.get('request_seq'), None)
+            if future is not None and not future.done():
+                future.set_result(message)
+                return
+        await super().on_receive(message)
+
+    async def ask_spend(self) -> Optional[str]:
+        """Ask EaaS whether this task's org may open a pipe: None, or the refusal."""
+        request = self.build_request('rrext_check_spend')
+        future = asyncio.get_running_loop().create_future()
+        self._asked[request['seq']] = future
+        try:
+            await self.send(request)
+            response = await future
+        finally:
+            self._asked.pop(request['seq'], None)
+        if self.did_fail(response):
+            raise RuntimeError(response.get('message'))
+        return (response.get('body') or {}).get('refusal')
 
     def _require_target(self) -> 'IServiceEndpoint':
         """Return the registered source target, or raise a controlled error.

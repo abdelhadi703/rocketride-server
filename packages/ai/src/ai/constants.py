@@ -151,6 +151,7 @@ CONST_DEFAULT_SIGNING_KEY = '<your signing key here -- replace in production>'
 # =============================================================================
 CONST_DATA_PIPE_TIMEOUT = 60.0  # seconds of inactivity before pipe is considered zombie
 CONST_DATA_SHUTDOWN_TIMEOUT = 30.0  # seconds to wait for data connection shutdown
+CONST_SPEND_CHECK_TIMEOUT = 10.0  # seconds a task waits for EaaS to answer a credit check
 CONST_DATA_OPEN_TARGET_WAIT = 5.0  # seconds `_open` waits for source to bind `state.target`
 
 # =============================================================================

@@ -17,11 +17,15 @@ Primary Responsibilities:
 Designed for integration with a FastAPI application and built on top of the ai.web debug server stack.
 """
 
+import asyncio
 from typing import TYPE_CHECKING, Optional
 from fastapi import WebSocket
 from dataclasses import dataclass
+import engLib
 from rocketlib import IEndpointBase
 from ai.common.dap import DAPBase, TransportWebSocket
+from ai.account.base import OutOfCreditsError
+from ai.constants import CONST_SPEND_CHECK_TIMEOUT
 from .data_conn import DataConn
 
 if TYPE_CHECKING:
@@ -130,10 +134,36 @@ class DataServer(DAPBase):
         # Signal we are connected
         await self._dapbase_on_connected(conn)
 
+        # EaaS is the only peer of /task/data: every getPipe() asks it for credit
+        global _eaas
+        _eaas = (conn, asyncio.get_running_loop())
+        engLib.setPipeGate(require_credit)
+
         # Accept the connection and start servicing it. This will not
         # return until the connection is closed
         await transport.accept(websocket=websocket)
 
+        if _eaas and _eaas[0] is conn:
+            _eaas = None
+
         # Signal we are disconnected
         await self._dapbase_on_disconnected(conn)
         return
+
+
+# The EaaS data connection and the loop it runs on, while EaaS is connected
+_eaas: 'tuple[DataConn, asyncio.AbstractEventLoop] | None' = None
+
+
+def require_credit() -> None:
+    """Engine pipe gate: raise OutOfCreditsError if this task's org may not open a pipe; served when EaaS is not connected."""
+    if _eaas is None:
+        return
+    conn, loop = _eaas
+    asking = asyncio.run_coroutine_threadsafe(conn.ask_spend(), loop)
+    try:
+        refusal = asking.result(CONST_SPEND_CHECK_TIMEOUT)
+    finally:
+        asking.cancel()  # no-op once answered; drops a question EaaS never answered
+    if refusal:
+        raise OutOfCreditsError(refusal)
