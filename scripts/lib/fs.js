@@ -291,9 +291,15 @@ async function copyFileEnsure(src, dest) {
 		} catch (err) {
 			// RO dest (e.g. part of JDK/JRE files) - force-remove RO dest and copy src in its place
 			if (err.code === 'EACCES' || err.code === 'EPERM') {
-				await fsp.access(src, fs.constants.R_OK);
-				await fsp.rm(dest, { force: true });
-				return await fsp.copyFile(src, dest);
+				const temp = path.join(path.dirname(dest), `.copy-${crypto.randomUUID()}.tmp`);
+				try {
+					// Fully read the source before removing a usable destination.
+					await fsp.copyFile(src, temp);
+					await fsp.rm(dest, { force: true });
+					return await fsp.copyFile(temp, dest);
+				} finally {
+					await fsp.rm(temp, { force: true });
+				}
 			}
 
 			throw err;
